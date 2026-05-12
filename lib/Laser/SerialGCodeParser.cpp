@@ -32,6 +32,14 @@ bool SerialGCodeParser::isMediaPresent(){
   return SD.mediaPresent(); 
 }
 
+bool SerialGCodeParser::executeCommand(const String &command) {
+  if (command.length() == 0) {
+    return false;
+  }
+
+  _parse(command);
+  return true;
+}
 
 // This uses UART to determine Gcode, lets retrofit to SPI for SD card 
 

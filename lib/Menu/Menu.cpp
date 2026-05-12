@@ -2,8 +2,25 @@
 
 static Menu* menuInstance = nullptr;
 
+namespace {
+String compactFileName(const String& fullPath, size_t maxLen = 18) {
+    int lastSlash = fullPath.lastIndexOf('/');
+    String fileName = (lastSlash >= 0) ? fullPath.substring(lastSlash + 1) : fullPath;
+
+    if (fileName.length() <= static_cast<int>(maxLen)) {
+        return fileName;
+    }
+
+    if (maxLen <= 3) {
+        return fileName.substring(0, maxLen);
+    }
+
+    return fileName.substring(0, maxLen - 3) + "...";
+}
+}
+
 Menu::Menu(RotaryEncoder& enc) 
-    :  encoder(&enc) {
+    :  encoder(&enc), sdGcode(BUILTIN_SDCARD) {
 
         menuInstance = this;
 
@@ -27,6 +44,7 @@ void Menu::begin() {
 
     this->encoder->begin();
     this->encoder->setMinMax(0, menuItemCount - 1);
+    sdReady = sdGcode.begin();
 
 
    Lnode* head = new Lnode("Main Menu", NULL,  MenuActions::MAIN_MENU); //0
@@ -36,6 +54,7 @@ void Menu::begin() {
     addNode(head, Lnode("About",MenuActions::MAIN_MENU, MenuActions::  ABOUT_MENU)); //4
     addNode(head, Lnode("Printer Info",MenuActions::ABOUT_MENU, MenuActions::PRINT_INFO)); //5
     addNode(head, Lnode("Print Cube",MenuActions::PRINT_MENU,MenuActions::PRINT_CUBE)); //6
+    addNode(head, Lnode("Print From SD",MenuActions::PRINT_MENU,MenuActions::GET_GCODE_FILES)); //6
     addNode(head, Lnode("Set Vaccum Chamber",MenuActions::SETTINGS_MENU,MenuActions::PUMP_CHAMBER)); //6
     addNode(head, Lnode("Fiber Calibration",MenuActions::SETTINGS_MENU, MenuActions::CALIBRATE_FIBER)); //7
     addNode(head, Lnode("Vacuum Calibration",MenuActions::TOOLS_MENU, MenuActions::CALIBRATE_VACUUM)); //8
@@ -55,6 +74,7 @@ void Menu::begin() {
     addNode(head, Lnode("Prepare Print",MenuActions::PRINT_HOMING, MenuActions::PREP_PRINT)); 
 
     Tnode* root = convert(head);
+    this->rootNode = root;
     this->currentNode = root;
 
     // store pointer to this instance so static callback functions can access members
@@ -95,44 +115,73 @@ void Menu::U8G2EZ_init(){
 
 void Menu::update(bool buttonState) {
     int newPosition = encoder->getPosition();
+
+    if (gcodePrintActive) {
+        this->encoder->setMinMax(0, 1);
+        this->currentSelection = this->encoder->getPosition();
+        if (buttonState) {
+            if (this->currentSelection == 0) {
+                requestCommand = MenuActions::TOGGLE_PAUSE_SD_GCODE_PRINT;
+            } else if (this->currentSelection == 1) {
+                requestCommand = MenuActions::CANCEL_SD_GCODE_PRINT;
+            }
+        }
+        printGcodeStatus();
+        return;
+    }
+
     if(!alarm){
-      //  for(int i = 0; i < sizeof(valueToChangeTo); i++){
-      //      valueToChangeTo[i] = inputValues[i];
-      //  }
         if(confirmCompletion){
             confirmCompletion = 0;
             requestCommand = 0;
             back();
         }
 
-
-
         if (newPosition != this->currentSelection) {
             this->currentSelection = newPosition;
-
             Serial.printf("Encoder moved to %d\n", this->currentSelection);
-        // draw();
         }
-        if(buttonState){ // As long as it's not the main menu
+
+        if(buttonState){
+            if (this->currentNode->act == MenuActions::GET_GCODE_FILES) {
+                int selected = this->encoder->getPosition();
+                if (selected == 0) {
+                    back();
+                    return;
+                }
+
+                int fileIndex = selected - 1;
+                if (fileIndex >= 0 && fileIndex < static_cast<int>(gcodeFiles.size())) {
+                    selectedGcodePath = gcodeFiles[fileIndex];
+                    requestCommand = MenuActions::START_SD_GCODE_PRINT;
+                    gcodePrintActive = true;
+                    gcodePrintPaused = false;
+                    gcodeCurrentLine = 0;
+                    gcodeTotalLines = 0;
+                    gcodeCurrentLineText = compactFileName(selectedGcodePath, 24);
+                    goToMainMenu();
+                    this->encoder->setPosition(0);
+                    this->currentSelection = 0;
+                }
+                return;
+            }
 
             if(this->currentSelection == 0 && this->currentNode->back != nullptr){
                 back();
-                //
                 return;
-            // Serial.println("Back button pressed");
             }
-            else{
-                
-                currentNode = currentNode->children[(this->currentNode->back != nullptr ? currentSelection-1 : currentSelection)];
-            // Serial.println("Button pressed, selection made.");
+
+            currentNode = currentNode->children[(this->currentNode->back != nullptr ? currentSelection-1 : currentSelection)];
+            if (currentNode->act == MenuActions::GET_GCODE_FILES) {
+                refreshGcodeFiles();
+                visibleTop = 0;
+                encoder->setPosition(0);
             }
-        
         }
         else{
-        actionSwitch(this->currentNode->act);
+            actionSwitch(this->currentNode->act);
         }
-    } 
-    
+    }
     else{
         this->u8g2->clearBuffer();
         this->u8g2->drawStr(34, 10, "An error has occured");
@@ -144,10 +193,7 @@ void Menu::update(bool buttonState) {
         snprintf(alarmStr, sizeof(alarmStr), "%d", alarm);
         this->u8g2->drawStr(80, 50, alarmStr);
         this->u8g2->sendBuffer();
-
-    }  
-
-   // Serial.print("Action Number:"); Serial.println();
+    }
 }
 
 // Converts a given linked list representing a complete 
@@ -321,6 +367,9 @@ void Menu::actionSwitch(int actionNum){
             break;
         case MenuActions::SMALL_STEP:
             smallStep();
+            break;
+        case MenuActions::GET_GCODE_FILES:
+            printGcodeFiles();
             break;
         
         default:
@@ -560,9 +609,116 @@ void Menu::printCube(){
     this->u8g2->sendBuffer();
 }
 
+void Menu::refreshGcodeFiles() {
+    if (!sdReady) {
+        sdReady = sdGcode.begin();
+    }
+
+    gcodeFiles.clear();
+    if (sdReady) {
+        gcodeFiles = sdGcode.getGcodeFiles("/");
+    }
+
+    gcodeFilesLoaded = true;
+}
+
+void Menu::printGcodeFiles() {
+    if (!gcodeFilesLoaded) {
+        refreshGcodeFiles();
+    }
+
+    this->u8g2->clearBuffer();
+    this->u8g2->setFont(u8g2_font_helvR08_tf);
+    this->u8g2->drawStr(0, 10, "SD Gcode Files");
+    this->u8g2->drawLine(0, 12, 95, 12);
+
+    const int totalItems = static_cast<int>(gcodeFiles.size()) + 1; // Back + files
+    this->encoder->setMinMax(0, totalItems - 1);
+
+    int selected = this->encoder->getPosition();
+    const int visibleRows = 4;
+
+    if (selected < visibleTop) {
+        visibleTop = selected;
+    }
+    if (selected >= visibleTop + visibleRows) {
+        visibleTop = selected - visibleRows + 1;
+    }
+
+    for (int row = 0; row < visibleRows; row++) {
+        int itemIndex = visibleTop + row;
+        if (itemIndex >= totalItems) {
+            break;
+        }
+
+        String label = (itemIndex == 0) ? "Back" : compactFileName(gcodeFiles[itemIndex - 1]);
+        int y = 10 + (row + 1) * 12;
+
+        this->u8g2->drawButtonUTF8(
+            128 / 2,
+            y,
+            (selected == itemIndex ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV),
+            34,
+            2,
+            0,
+            label.c_str());
+    }
+
+    if (!sdReady) {
+        this->u8g2->drawStr(0, 62, "SD init failed");
+    } else if (gcodeFiles.empty()) {
+        this->u8g2->drawStr(0, 62, "No .gcode files found");
+    }
+
+    this->u8g2->sendBuffer();
+}
+
+void Menu::printGcodeStatus() {
+    this->u8g2->clearBuffer();
+    this->u8g2->setFont(u8g2_font_helvR08_tf);
+    this->u8g2->drawStr(0, 10, "Gcode Print Active");
+    this->u8g2->drawLine(0, 12, 110, 12);
+
+    char progress[24];
+    int percentage = (gcodeTotalLines > 0) ? (100 * gcodeCurrentLine) / gcodeTotalLines : 0;
+    snprintf(progress, sizeof(progress), "%d/%d %d%%", gcodeCurrentLine, gcodeTotalLines, percentage);
+
+    this->u8g2->drawStr(0, 24, "Progress:");
+    this->u8g2->drawStr(54, 24, progress);
+    this->u8g2->drawStr(0, 36, "Line:");
+
+    String compactLine = compactFileName(gcodeCurrentLineText, 20);
+    this->u8g2->drawStr(30, 36, compactLine.c_str());
+
+    const char* pauseLabel = gcodePrintPaused ? "Resume" : "Pause";
+
+    this->u8g2->drawButtonUTF8(128 / 2, 50,
+        (encoder->getPosition() == 0 ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV),
+        34, 2, 0, pauseLabel);
+
+    this->u8g2->drawButtonUTF8(128 / 2, 62,
+        (encoder->getPosition() == 1 ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV),
+        34, 2, 0, "Cancel");
+
+    this->u8g2->sendBuffer();
+}
+
 //--------------------------------------------------------------
 
+void Menu::goToMainMenu() {
+    if (rootNode != nullptr) {
+        currentNode = rootNode;
+    }
+    currentSelection = 0;
+    visibleTop = 0;
+    encoder->setPosition(0);
+}
+
 void Menu::back(){
+    if (gcodePrintActive) {
+        return;
+    }
+
     if(this->currentNode->back != nullptr){
         requestCommand = 0;
         this->currentNode = this->currentNode->back;

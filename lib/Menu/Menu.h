@@ -4,6 +4,7 @@
 #include <U8g2lib.h>
 #include <queue>
 #include <functional> // For std::function
+#include <SDGcode.h>
 
 #ifdef U8X8_HAVE_HW_SPI
 #include <SPI.h>
@@ -43,7 +44,10 @@ enum MenuActions {
     ONE_CYCLE = 22,
     PRINT_CUBE = 23,
     DEACTIVATE_FIBER_LASER = 24,
-    
+    GET_GCODE_FILES = 25,
+    START_SD_GCODE_PRINT = 26,
+    CANCEL_SD_GCODE_PRINT = 27,
+    TOGGLE_PAUSE_SD_GCODE_PRINT = 28,
 
 
 };
@@ -102,6 +106,7 @@ class Menu {
         void begin();
         void update(bool buttonState);
         void back();
+        void goToMainMenu();
         void printFoundI2C(int connected);
         // Passthroughs to communciate to the other board, or fiber laser
 
@@ -109,6 +114,13 @@ class Menu {
         bool alarm  = 0; // An alarm command to default to issues 
         int waitforResponse = 0; // a callback in  main to show 
         bool confirmCompletion = false; // Change this value to confirm the menu should return to its normal status
+
+        String selectedGcodePath = "";
+        bool gcodePrintActive = false;
+        bool gcodePrintPaused = false;
+        int gcodeCurrentLine = 0;
+        int gcodeTotalLines = 0;
+        String gcodeCurrentLineText = "";
 
         
     
@@ -161,8 +173,17 @@ class Menu {
         void smallStep();
         void oneCycle();
         void printCube();
+        void printGcodeFiles();
+        void printGcodeStatus();
         void deactivateFiberLaser();
         void deactivateGuideLaser();
+        void refreshGcodeFiles();
+
+        SDGcode sdGcode;
+        bool sdReady = false;
+        bool gcodeFilesLoaded = false;
+        std::vector<String> gcodeFiles;
+        Tnode* rootNode = nullptr;
         
 
 

@@ -20,6 +20,7 @@ public:
   /// sent, the connected XY2-100 devices's clock will be ticked.
   void listen();
   bool connectSD();
+  bool executeCommand(const String &command);
 
   bool isMediaPresent(); 
 
