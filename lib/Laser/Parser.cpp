@@ -2,6 +2,26 @@
 
 // Extract the laser from the command assuming the laser name is the only
 // argument
+
+/*
+Gcode List of Commands:
+
+G0 X Y F S
+G1 X Y F
+
+// Starting Gcode:
+
+M57 L1
+G28 -- Home Galvo
+M13 S79 H50000 W155 -- Power, frequency, width -- Prepare Laser
+M54 -- Turn on laser
+G0 X0 Y0 -- Home galvo (center of chamber)
+
+// Ending code -- M55
+
+
+*/
+
 #define _extract_laser_as_only_argument command.substring(3)
 #define _extract_xy extractValue('X'), extractValue('Y')
 

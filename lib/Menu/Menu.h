@@ -48,8 +48,8 @@ enum MenuActions {
     START_SD_GCODE_PRINT = 26,
     CANCEL_SD_GCODE_PRINT = 27,
     TOGGLE_PAUSE_SD_GCODE_PRINT = 28,
-
-
+    START_FAN = 29,
+    STOP_FAN = 30,
 };
 
 class Lnode {
@@ -129,6 +129,9 @@ class Menu {
         // Functions associated with menu functionality
 
         void printChildren(Tnode* node, char* name, bool printLayerChildren = true, bool sendBuffer = true);    
+        // Draws a vertical scrollbar on the right edge when totalItems > visibleCount.
+        // firstVisible is the index of the topmost item currently shown.
+        void drawScrollbar(int totalItems, int visibleCount, int firstVisible);
         void actionSwitch(int actionNum);
         Tnode* convert(Lnode* head);
         void addNode(Lnode*& head, Lnode next);
@@ -178,7 +181,15 @@ class Menu {
         void deactivateFiberLaser();
         void deactivateGuideLaser();
         void refreshGcodeFiles();
+        void startFan();
+        void stopFan();
 
+    public:
+        // Draws the "Please fill material / Continue" prompt once. Call this
+        // in a loop (polling the button externally) so the screen stays refreshed.
+        void showFillMaterialPrompt();
+
+    private:
         SDGcode sdGcode;
         bool sdReady = false;
         bool gcodeFilesLoaded = false;

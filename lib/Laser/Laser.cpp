@@ -119,26 +119,26 @@ void Laser::turnOff() { //
 }
 
 
-void Laser::setPower(int power) { 
+void Laser::setPower(int power) {
+  // power is a percentage in [0, 100]. We have 8 pump-enable pins, so each
+  // pin corresponds to 12.5% of full power. Round to the nearest pump count
+  // and drive ALL pins (HIGH for the active ones, LOW for the rest) so a
+  // call to setPower() with a lower value actually reduces the output.
+  if (power > 100) power = 100;
+  else if (power < 0) power = 0;
+
+  const int numPins  = sizeof(powerPumpPins) / sizeof(powerPumpPins[0]);
+  const int pumpsOn  = (power * numPins + 50) / 100; // round-to-nearest
+
   _power = power;
 
-  if(_power > 8){
-    _power = 8;
+  for (int i = 0; i < numPins; i++) {
+    bool on = (i < pumpsOn);
+    digitalWrite(powerPumpPins[i], on ? HIGH : LOW);
+    Serial.printf("Pump pin %d -> %s\n", powerPumpPins[i], on ? "HIGH" : "LOW");
   }
-  else if(_power < 0){
-    _power = 0;
-  }
-
-  //Enable each bit based on the power
-  for(int i = 0; i < _power; i++){
-    if(power > i){
-      Serial.printf("Setting pin: %d to HIGH", powerPumpPins[i]);
-      Serial.println();
-      digitalWrite(powerPumpPins[i], HIGH);
-    }
-  }
-
- }
+  Serial.printf("setPower(%d%%): %d/%d pumps on\n", power, pumpsOn, numPins);
+}
 
 void Laser::setPulseFrequency(unsigned int pulseFrequency) {
 

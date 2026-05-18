@@ -259,7 +259,7 @@ int SerialGCodeParser::activateFiberLaserDebug(){
 
     _g28(); // Home galvo
 
-    _m13(8, 50000, 155); // Prepare the laser
+    _m13(70, 50000, 155); // Prepare the laser
     _m54(); // Turn Laser on
     _g0(0,0); // Also home galvo (center of chamber) 
     int code = _laser1->getAlarmState();

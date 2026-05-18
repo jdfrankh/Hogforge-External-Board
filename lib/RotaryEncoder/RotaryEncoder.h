@@ -17,6 +17,8 @@ public:
     void setMinMax(int32_t minPosition, int32_t maxPosition);
     void setWrapAround(bool wrap);
     void setStepsPerNotch(int steps);
+    void debugPrintPosition();
+
     
 
 

@@ -4,7 +4,8 @@
 #include "SerialGCodeParser.h"
 #include <Wire.h>
 #include "Menu.h"
-#include <I2CBus.h>
+#include "Relay.h"
+#include <UARTComms.h>
 #include <SDGcode.h>
 
 // --- Pin Definitions ---
@@ -29,8 +30,10 @@ enum IncomingCommands{
     PREPPRINT = 7,
     MOVEBAR = 8,
     INITALL = 9,
-    ONECYCLE = 10,
-    PRINTCUBE = 11,
+    STARTFAN = 10,
+    STOPFAN = 11,
+    ONECYCLE = 12,
+    PRINTCUBE = 13,
 
 
 
@@ -80,8 +83,10 @@ RotaryEncoder encoder = RotaryEncoder(ENCODER_CLK_PIN, ENCODER_DT_PIN);
 Laser *laser; 
 XY2_100 *galvo;
 SerialGCodeParser *gcodeInterpreter;
-I2CBus i2c;
+UARTComms i2c; // UART link to Internal Board (Serial6: TX=pin 24/A10, RX=pin 25/A11)
 SDGcode sdGcodeReader(BUILTIN_SDCARD);
+Relays *relays; 
+
 
 struct SdPrintSession {
   bool active = false;
@@ -99,6 +104,7 @@ void stopSdPrintSession();
 void togglePauseSdPrintSession();
 void serviceSdPrintSession();
 String joinTokens(const std::vector<String> &tokens);
+bool mainGcodeFunction(const std::vector<String> &tokens);
 
 
 void waitForResponse(){
@@ -112,6 +118,32 @@ void waitForResponse(){
       menu->waitforResponse = 2;
       menu->update(false);
 
+}
+
+// Block until the Internal Board reports idle (d1==2 from Xiao) or timeout.
+// Called after sending any motion command so GCode lines execute in order.
+// Also services the Pause / Cancel buttons on the print-status screen so the
+// user can interact during motion waits.
+static void waitForInternalBoard(uint32_t timeoutMs = 600000) {
+  uint32_t deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    if (i2c.update() && i2c.lastData1() == 2) return;
+    menu->update(handleSwitch()); // keep display alive and detect button presses
+    // Handle cancel / pause raised from the print-status screen.
+    if (menu->requestCommand == MenuActions::CANCEL_SD_GCODE_PRINT) {
+      menu->requestCommand = 0;
+      stopSdPrintSession();
+      return; // session is stopped; caller will see active==false and exit
+    }
+    if (menu->requestCommand == MenuActions::TOGGLE_PAUSE_SD_GCODE_PRINT) {
+      menu->requestCommand = 0;
+      togglePauseSdPrintSession();
+      // Keep waiting for the current motion to finish; the pause flag stops
+      // the next G-code line from running once we return.
+    }
+    delay(10);
+  }
+  // Timeout — continue anyway so a stalled board doesn't hang the print.
 }
 
 String joinTokens(const std::vector<String> &tokens) {
@@ -199,18 +231,172 @@ void serviceSdPrintSession() {
   menu->gcodeCurrentLine = static_cast<int>(sdPrintSession.nextLine + 1);
   menu->gcodeTotalLines = static_cast<int>(sdPrintSession.lines.size());
 
-  gcodeInterpreter->executeCommand(command);
+
+  if(!mainGcodeFunction(tokens)){
+    gcodeInterpreter->executeCommand(command);
+  }
+  else{
+    
+  }
+  
   sdPrintSession.nextLine++;
 }
 
-void beginPrint(){
+bool mainGcodeFunction(const std::vector<String> &tokens) {
+
+  //Move Based : 
+  //G0  -- Just travel
+  // G1 -- Travel with laser on 
+  // G3 G4 G9  -- Other Movement Based Commands
+  // G28 -- Set Home G28.1 
+  //Plane Setting (Redundant): G17 G18 G19 G91 G92
+  // M13 -- Prep Laser
+  //M14 -- Disable Laser
+  // M54 - Enable Laser
+  //M55 -- Disable Laser (Redundant with M14 but just in case)
+
+  //M56 -- Set guide beam
+  //M57 -- Disable Guide Beam
+
+  //Redundant but taken : M60 M61 M98 M38 M39 M40 M41 M16 M17 M00 M01 M02
+
+  // Needed Here:
+
+  //Enable Vacuum Pump M15
+  //Wait for a few seconds G30 T20 (seconds) 
+  //Disable Vacuum Pump M16
+  //Enable Argon Solenoid  M17
+  //Disable Argon Solenoid M18
+  //M19 Fill Material (pause, prompt user, wait for button press)
+  //M20 Turn circulation fan on
+  //M21 Turn circulation fan off
+  
+  //Home all (plates and bar) G31
+  //Prepare for Print - Set a value for how high the plate should be lifted.  G32 Z[value in mm, 1000 = 1mm]
+  //Move the bar G33
+  //Move one small step G34 Z[value in mm, 1000 = 1mm]
+  //Home just Plates G35
+  //Home just the bar G36
 
 
+  if (tokens.empty()) {
+    return false;
+  }
+
+  // Helper to pull the numeric value following a parameter letter
+  // (e.g. "Z1500" -> 1500.0, "T20" -> 20.0).  Returns ``defaultValue``
+  // when the letter is not present in the token list.
+  auto findParam = [&tokens](char letter, float defaultValue) -> float {
+    letter = (char)toupper(letter);
+    for (size_t i = 1; i < tokens.size(); ++i) {
+      const String &t = tokens[i];
+      if (t.length() >= 2 && (char)toupper(t[0]) == letter) {
+        return t.substring(1).toFloat();
+      }
+    }
+    return defaultValue;
+  };
+
+  const String &code = tokens[0];
+
+  // ---- G-codes ----------------------------------------------------------
+  if (code.equalsIgnoreCase("G30")) {
+    // Dwell — T<seconds>
+    long seconds = (long)findParam('T', 0.0f);
+    if (seconds > 0) {
+      delay((unsigned long)seconds * 1000UL);
+    }
+    return true;
+  }
+  if (code.equalsIgnoreCase("G31")) {
+    // Home all (plates + bar)
+    i2c.sendData(IncomingCommands::HOMEALL, 0);
+    waitForInternalBoard();
+    return true;
+  }
+  if (code.equalsIgnoreCase("G32")) {
+    // Prep print — Z value in mm * 1000.  Existing PREPPRINT handler
+    // expects the same scaled integer the menu sends (e.g. 49 == 49000).
+    int z = (int)findParam('Z', 0.0f);
+    i2c.sendData(IncomingCommands::PREPPRINT, z);
+    waitForInternalBoard();
+    return true;
+  }
+  if (code.equalsIgnoreCase("G33")) {
+    // Move bar (full sweep)
+    i2c.sendData(IncomingCommands::MOVEBAR, 0);
+    waitForInternalBoard();
+    return true;
+  }
+  if (code.equalsIgnoreCase("G34")) {
+    // One small step — Z in mm * 1000
+    int z = (int)findParam('Z', 0.0f);
+    i2c.sendData(IncomingCommands::SMALLSTEP, z);
+    waitForInternalBoard();
+    return true;
+  }
+  if (code.equalsIgnoreCase("G35")) {
+    // Home just the plates
+    i2c.sendData(IncomingCommands::HOMEPLATES, 0);
+    waitForInternalBoard();
+    return true;
+  }
+  if (code.equalsIgnoreCase("G36")) {
+    // Home just the bar
+    i2c.sendData(IncomingCommands::HOMEBAR);
+    waitForInternalBoard();
+    return true;
+  }
+
+  // ---- M-codes ----------------------------------------------------------
+  if (code.equalsIgnoreCase("M15")) {
+    // Enable vacuum pump
+    if (relays) relays->on(Relays::VACUUM_PUMP);
+    return true;
+  }
+  if (code.equalsIgnoreCase("M16")) {
+    // Disable vacuum pump
+    if (relays) relays->off(Relays::VACUUM_PUMP);
+    return true;
+  }
+  if (code.equalsIgnoreCase("M17")) {
+    // Enable argon solenoid
+    if (relays) relays->on(Relays::ARGON_SOLENOID);
+    return true;
+  }
+  if (code.equalsIgnoreCase("M18")) {
+    // Disable argon solenoid
+    if (relays) relays->off(Relays::ARGON_SOLENOID);
+    return true;
+  }
+  if (code.equalsIgnoreCase("M20")) {
+    // Turn circulation fan on (max speed)
+    i2c.sendData(IncomingCommands::STARTFAN, 0);
+    return true;
+  }
+  if (code.equalsIgnoreCase("M21")) {
+    // Turn circulation fan off
+    i2c.sendData(IncomingCommands::STOPFAN, 0);
+    return true;
+  }
+  if(code.equalsIgnoreCase("M19")){
+    // Pause gcode execution and prompt the user to fill material.
+    // Keep re-drawing the screen until the rotary-encoder button is pressed.
+    menu->showFillMaterialPrompt();
+    while (!handleSwitch()) {
+      menu->showFillMaterialPrompt();
+      delay(50);
+    }
+    return true;
+  }
+
+  return false;
 }
+
 
 void setup() {
   Serial.begin(115200);
-  //delay(2000); // Wait for serial
+  delay(2000); // Wait for serial
   
   
 // put your setup code here, to run once:
@@ -228,7 +414,8 @@ void setup() {
 
   menu->begin();
 
-  i2c.init();
+  // Serial6 on Teensy 4.1: TX = pin 24 (A10), RX = pin 25 (A11)
+  i2c.init(&Serial6, 115200, UART_ROLE_MASTER);
   int connected = i2c.scan();
 
   
@@ -236,7 +423,11 @@ void setup() {
 
    menu->printFoundI2C(connected );
   gcodeInterpreter->resetCounters();
-  pinMode(ENCODER_SW_PIN, INPUT);
+  // INPUT_PULLUP (not INPUT): the switch is wired to GND with no external
+  // pull-up, so a floating pin would pick up noise from the CLK/DT lines
+  // during rotation and look like phantom button presses — making the menu
+  // bounce between Main and Print whenever the encoder is turned.
+  pinMode(ENCODER_SW_PIN, INPUT_PULLUP);
   
 
   // Attach the switch interrupt to the SW pin (triggered when the button is pressed, usually LOW)
@@ -300,7 +491,11 @@ int determineAction(int action){
       return gcodeInterpreter->Success;
     break;
   case MenuActions::PREP_PRINT:
-      i2c.sendData(IncomingCommands::PREPPRINT, 49); // 49 * 1000
+      // Single atomic command: the Internal Board homes both plates, waits
+      // for homing to finish (otherwise the limit-switch ISRs stomp any
+      // queued moveTo target), then lifts BuildPlate to totalPlateDistance
+      // (120000, hardcoded in Internal main.h) and LoadPlate to arg 2.
+      i2c.sendData(IncomingCommands::PREPPRINT, 0, 60000);
       return gcodeInterpreter->Success;
     break;
   case MenuActions::HOME_ALL:
@@ -312,7 +507,15 @@ int determineAction(int action){
       return gcodeInterpreter->Success;
     break;
   case MenuActions::SMALL_STEP:
-    i2c.sendData(IncomingCommands::SMALLSTEP, 50);
+    i2c.sendData(IncomingCommands::SMALLSTEP, 1000);
+    return gcodeInterpreter->Success;
+    break;
+  case MenuActions::START_FAN:
+    i2c.sendData(IncomingCommands::STARTFAN, 0);
+    return gcodeInterpreter->Success;
+    break;
+  case MenuActions::STOP_FAN:
+    i2c.sendData(IncomingCommands::STOPFAN, 0);
     return gcodeInterpreter->Success;
     break;
   case MenuActions::ONE_CYCLE:

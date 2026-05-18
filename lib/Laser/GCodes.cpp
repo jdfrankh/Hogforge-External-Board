@@ -8,9 +8,10 @@
 
 void SerialGCodeParser::_g1(int x, int y) {
  
-  _m55();
-  _galvo->setXY(centerX(x), centerY(y));
+  //_m55();
   _m54();
+  _galvo->setXY(centerX(x), centerY(y));
+  
   /* if (axis == 'X') {
     _galvo->setXY(target, _galvo_mode_adjusted_y);
   } else if (axis == 'Y') {
@@ -107,6 +108,7 @@ void SerialGCodeParser::_m53(String laser) {
 
 void SerialGCodeParser::_g0(int x, int y) {
  // _m54();
+   _m55(); 
   _galvo->setXY(centerX(x), centerY(y));
  // _m55();
 }

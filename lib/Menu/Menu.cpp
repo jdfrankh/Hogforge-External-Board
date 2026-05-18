@@ -60,6 +60,8 @@ void Menu::begin() {
     addNode(head, Lnode("Vacuum Calibration",MenuActions::TOOLS_MENU, MenuActions::CALIBRATE_VACUUM)); //8
     addNode(head, Lnode("Toggle Laser Settings",MenuActions::TOOLS_MENU, MenuActions::PRINT_TOGGLE_LASER)); //10
     addNode(head, Lnode("Test Pushbar",MenuActions::TOOLS_MENU, MenuActions::MOVE_BAR)); 
+    addNode(head, Lnode("Start Fan",MenuActions::TOOLS_MENU, MenuActions::START_FAN)); 
+    addNode(head, Lnode("Stop Fan",MenuActions::TOOLS_MENU, MenuActions::STOP_FAN)); 
     addNode(head, Lnode("Debug Controls",MenuActions::TOOLS_MENU, MenuActions::PRINT_DEBUG)); 
     addNode(head, Lnode("Run Through Step by Step",MenuActions::PRINT_DEBUG, MenuActions::SMALL_STEP)); 
     addNode(head, Lnode("Do One Cycle",MenuActions::PRINT_DEBUG, MenuActions::ONE_CYCLE)); 
@@ -114,6 +116,9 @@ void Menu::U8G2EZ_init(){
 }
 
 void Menu::update(bool buttonState) {
+    // DEBUG: Print encoder position to Serial every update
+    encoder->debugPrintPosition();
+
     int newPosition = encoder->getPosition();
 
     if (gcodePrintActive) {
@@ -371,6 +376,12 @@ void Menu::actionSwitch(int actionNum){
         case MenuActions::GET_GCODE_FILES:
             printGcodeFiles();
             break;
+        case MenuActions::START_FAN:
+            startFan();
+            break;
+        case MenuActions::STOP_FAN:
+            stopFan();
+            break;
         
         default:
             Serial.println("No action assigned");
@@ -391,10 +402,33 @@ void Menu::printMainMenu( ){
 
     std::vector<String> children = this->currentNode->getChildrenNames();
 
-    for(int i = 0; i < children.size(); i++){
-         this->u8g2->drawButtonUTF8(128/2, 10 + (i+1)*12, (encoder->getPosition() == i ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV)  , 34 , 2 ,0, children[i].c_str());
-    } 
-    
+    const int VISIBLE_ROWS = 4;
+    const int total = (int)children.size();
+    int selected = encoder->getPosition();
+
+    // Keep selection inside the visible window. Because the encoder wraps,
+    // jumping from the last item to 0 (or 0 to last) is handled correctly
+    // by these two clamps: selected<top snaps top down, selected>=top+rows
+    // snaps top up.
+    if (total <= VISIBLE_ROWS) {
+        visibleTop = 0;
+    } else {
+        if (selected < visibleTop)               visibleTop = selected;
+        if (selected >= visibleTop + VISIBLE_ROWS) visibleTop = selected - (VISIBLE_ROWS - 1);
+        if (visibleTop < 0)                       visibleTop = 0;
+        if (visibleTop > total - VISIBLE_ROWS)    visibleTop = total - VISIBLE_ROWS;
+    }
+
+    int rowsToDraw = total < VISIBLE_ROWS ? total : VISIBLE_ROWS;
+    for (int row = 0; row < rowsToDraw; row++) {
+        int i = visibleTop + row;
+        this->u8g2->drawButtonUTF8(128/2, 10 + (row+1)*12,
+            (selected == i ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV),
+            34, 2, 0, children[i].c_str());
+    }
+
+    drawScrollbar(total, VISIBLE_ROWS, visibleTop);
+
     this->u8g2->sendBuffer();
 
 
@@ -444,6 +478,14 @@ void Menu::printHoming(){
     this->printChildren(this->currentNode, "Homing Calibration");
    // Serial.println("Print Selected");
    // drawSimple("Print", 1000, 0, 30, true);
+}
+
+void Menu::startFan(){
+    requestCommand = START_FAN;
+}
+
+void Menu::stopFan(){
+    requestCommand = STOP_FAN;
 }
 
 void Menu::smallStep(){
@@ -565,6 +607,18 @@ void Menu::prepPrint(){
     this->u8g2->drawButtonUTF8(105, 10, (encoder->getPosition() == 0 ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV), 34, 2, 0, "Back");
     this->u8g2->drawButtonUTF8(128/2, 20, (encoder->getPosition() == 0 ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV), 34, 2, 0, "Lifting Build");
     this->u8g2->drawButtonUTF8(128/2,30,(encoder->getPosition() == 1 ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV), 34 ,2 ,0, "Plate");
+    this->u8g2->sendBuffer();
+}
+
+void Menu::showFillMaterialPrompt() {
+    this->u8g2->clearBuffer();
+    this->u8g2->setFont(u8g2_font_helvR08_tf);
+    this->u8g2->drawStr(0, 10, "Fill Material");
+    this->u8g2->drawLine(0, 12, 128, 12);
+    this->u8g2->drawStr(4, 28, "Please fill material");
+    this->u8g2->drawStr(4, 40, "before continuing.");
+    // "Continue" button is always highlighted — it is the only action
+    this->u8g2->drawButtonUTF8(64, 58, U8G2_BTN_HCENTER | U8G2_BTN_BW2, 0, 2, 2, "Continue");
     this->u8g2->sendBuffer();
 }
 
@@ -733,18 +787,67 @@ void Menu::printChildren(Tnode* node, char* name, bool printLayerChildren = true
     this->u8g2->drawStr(0, 10, name);
     this->u8g2->drawLine(0, 12, 75, 12);
     this->encoder->setMinMax(0, node->children.size());
+    this->encoder->setWrapAround(true);
     //this->encoder->setPosition(0);
     this->u8g2->drawButtonUTF8(105, 10, (encoder->getPosition() == 0 ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV), 34, 2, 0, "Back");
 
     if(printLayerChildren){
         std::vector<String> children = node->getChildrenNames();
 
-        for(int i = 0; i < children.size(); i++){
+        const int VISIBLE_ROWS = 4;
+        const int total = (int)children.size();
+        int selected = encoder->getPosition();        // 0 = Back, 1..total = children
+        int selectedChild = selected - 1;              // -1 means "Back is selected"
 
-            this->u8g2->drawButtonUTF8(128/2, 10 + (i+1)*12, (encoder->getPosition() == (i+1) ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV)  , 34 , 2 ,0, children[i].c_str());
-        } 
+        // Snap the visible window so the highlighted child is in view. When
+        // "Back" is selected (selectedChild < 0) leave the window where it
+        // was so the user can see where they came from.
+        if (total <= VISIBLE_ROWS) {
+            visibleTop = 0;
+        } else if (selectedChild >= 0) {
+            if (selectedChild < visibleTop)                  visibleTop = selectedChild;
+            if (selectedChild >= visibleTop + VISIBLE_ROWS)  visibleTop = selectedChild - (VISIBLE_ROWS - 1);
+            if (visibleTop < 0)                              visibleTop = 0;
+            if (visibleTop > total - VISIBLE_ROWS)           visibleTop = total - VISIBLE_ROWS;
+        }
+
+        int rowsToDraw = total < VISIBLE_ROWS ? total : VISIBLE_ROWS;
+        for (int row = 0; row < rowsToDraw; row++) {
+            int i = visibleTop + row;
+            this->u8g2->drawButtonUTF8(128/2, 10 + (row+1)*12,
+                (selected == (i+1) ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV),
+                34, 2, 0, children[i].c_str());
+        }
+
+        drawScrollbar(total, VISIBLE_ROWS, visibleTop);
     }
     
     
     if(sendBuffer) this->u8g2->sendBuffer();
+}
+
+void Menu::drawScrollbar(int totalItems, int visibleCount, int firstVisible) {
+    if (totalItems <= visibleCount) return;
+
+    // Track: vertical strip along the right edge spanning the rows region.
+    // Rows live between y=14 and y=64 (4 rows * 12px starting at y=22 button
+    // centers, button height ~12). Use a 2px-wide track at x=125..126.
+    const int trackX     = 125;
+    const int trackY     = 14;
+    const int trackW     = 2;
+    const int trackH     = 50;
+
+    this->u8g2->drawFrame(trackX, trackY, trackW, trackH);
+
+    int thumbH = (trackH * visibleCount) / totalItems;
+    if (thumbH < 4) thumbH = 4;
+    if (thumbH > trackH) thumbH = trackH;
+
+    int maxTop   = totalItems - visibleCount;
+    int thumbY   = trackY;
+    if (maxTop > 0) {
+        thumbY = trackY + ((trackH - thumbH) * firstVisible) / maxTop;
+    }
+
+    this->u8g2->drawBox(trackX, thumbY, trackW, thumbH);
 }
