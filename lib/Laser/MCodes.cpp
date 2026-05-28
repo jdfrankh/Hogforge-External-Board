@@ -56,10 +56,12 @@ void SerialGCodeParser::_resume() {
 #pragma endregion
 
 void SerialGCodeParser::_m56(String laser = "L1") {
+  _guide_beam_on = true;
   _set_guide_beam(laser, true);
 }
 
 void SerialGCodeParser::_m57(String laser = "L1") {
+  _guide_beam_on = false;
   _set_guide_beam(laser, false);
 }
 
@@ -69,6 +71,10 @@ void SerialGCodeParser::_m60(String laser = "L1") {
 
 void SerialGCodeParser::_m61(String laser = "L1") {
   _set_branch_shutter(laser, false);
+}
+
+void SerialGCodeParser::_m58(float mm_per_min) {
+  _feedrate_mm_per_min = mm_per_min;
 }
 
 void SerialGCodeParser::_m98() {

@@ -18,6 +18,12 @@ const int DELAY_PLATE_LIFT = 15000;
 const int DELAY_SMALL_STEP = 750;
 const int DELAY_FULL_SWIPE = 5000;
 
+// Build plate lead screw: 0.00635 mm per full step
+// Lead screw pitch: 0.00635 mm per FULL STEP (1.27 mm/rev ÷ 200 steps/rev).
+// TMC drivers run at 16× microstepping, so position units are microsteps.
+// Multiply by 16 to convert from full-steps/mm to microsteps/mm.
+constexpr float Z_STEPS_PER_MM = 16.0f / 0.00635f; // ~2519.7 microsteps/mm
+
 enum IncomingCommands{
 
     HOMEALL = 0,
@@ -45,16 +51,16 @@ enum IncomingCommands{
 long lastButtonPressTime = 0; // To manage debounce timing
 
 bool handleSwitch() {
-      // This ISR runs when the interruptPin changes state
     if(digitalRead(ENCODER_SW_PIN) == LOW) {
       long currentTime = millis();
-      //Serial.println("Switch pressed");
       if (currentTime - lastButtonPressTime > 250) {
         lastButtonPressTime = currentTime;
-      return true;
+        return true;
+      }
+      // Do NOT update lastButtonPressTime here — doing so would extend the
+      // debounce window on every poll tick while the button is held, making
+      // it impossible to register the next press until 250 ms after *release*.
     }
-    lastButtonPressTime = currentTime;
-  }
     return false;
   }
 
@@ -85,13 +91,27 @@ XY2_100 *galvo;
 SerialGCodeParser *gcodeInterpreter;
 UARTComms i2c; // UART link to Internal Board (Serial6: TX=pin 24/A10, RX=pin 25/A11)
 SDGcode sdGcodeReader(BUILTIN_SDCARD);
-Relays *relays; 
+Relays *relays;
+
+// ── GCode batch buffer ─────────────────────────────────────────────────────
+// Pre-fetches up to BATCH_CAPACITY executable lines from the SD card so the
+// galvo scan loop runs without per-move SD-access latency.  Each readLine()
+// costs ~200 µs–1 ms of SDIO overhead; without batching that stalls the
+// galvo between every G1 move.
+// Placed in Teensy OCRAM (DMAMEM) to keep DTCM free for fast variables.
+// 15500 × 32 B ≈ 480 KB — covers entire LaserTest.gcode (10 529 lines)
+// in a single batch with ~15 KB margin to spare in OCRAM.
+// Reduce BATCH_CAPACITY if the linker reports RAM overflow.
+static const int BATCH_CAPACITY = 15500;
+static const int BATCH_LINE_MAX = 32;    // max chars per GCode line + NUL
+DMAMEM static char s_batchBuf[BATCH_CAPACITY][BATCH_LINE_MAX];
+static int         s_batchCount = 0;     // executable lines loaded
+static int         s_batchHead  = 0;     // index of next line to execute
 
 
 struct SdPrintSession {
   bool active = false;
   bool paused = false;
-  std::vector<std::vector<String>> lines;
   size_t nextLine = 0;
   String selectedPath = "";
 };
@@ -120,11 +140,38 @@ void waitForResponse(){
 
 }
 
+// Non-blocking timed wait — keeps the display refreshed and services
+// pause / cancel button presses during delays like M15 / M17.
+// Returns false (and stops the session) if the user cancels mid-wait;
+// returns true when the full duration has elapsed.
+static bool waitWithMenuUpdates(uint32_t ms) {
+  uint32_t deadline = millis() + ms;
+  while (millis() < deadline) {
+    menu->update(handleSwitch());
+    if (menu->requestCommand == MenuActions::CANCEL_SD_GCODE_PRINT) {
+      menu->requestCommand = 0;
+      stopSdPrintSession();
+      return false;
+    }
+    if (menu->requestCommand == MenuActions::TOGGLE_PAUSE_SD_GCODE_PRINT) {
+      menu->requestCommand = 0;
+      togglePauseSdPrintSession();
+    }
+    delay(10);
+  }
+  return true;
+}
+
 // Block until the Internal Board reports idle (d1==2 from Xiao) or timeout.
 // Called after sending any motion command so GCode lines execute in order.
 // Also services the Pause / Cancel buttons on the print-status screen so the
 // user can interact during motion waits.
 static void waitForInternalBoard(uint32_t timeoutMs = 600000) {
+  // Drain any stale "done" packets that accumulated from the previous
+  // command's 200-ms re-send loop on the internal board, so we don't
+  // mistake them for the completion signal of the command we just issued.
+  while (i2c.update());
+
   uint32_t deadline = millis() + timeoutMs;
   while (millis() < deadline) {
     if (i2c.update() && i2c.lastData1() == 2) return;
@@ -168,10 +215,16 @@ void startSdPrintSession(const String &path) {
     return;
   }
 
-  sdPrintSession.lines = sdGcodeReader.parseGcodeFile(path);
-  if (sdPrintSession.lines.empty()) {
+  int totalLines = sdGcodeReader.countGcodeLines(path);
+  if (totalLines == 0) {
     menu->gcodePrintActive = false;
     menu->gcodeCurrentLineText = "No gcode lines";
+    return;
+  }
+
+  if (!sdGcodeReader.openGcodeFile(path)) {
+    menu->gcodePrintActive = false;
+    menu->gcodeCurrentLineText = "SD open failed";
     return;
   }
 
@@ -180,17 +233,20 @@ void startSdPrintSession(const String &path) {
   sdPrintSession.nextLine = 0;
   sdPrintSession.selectedPath = path;
 
+  s_batchCount = 0;
+  s_batchHead  = 0;
+
   menu->gcodePrintActive = true;
   menu->gcodePrintPaused = false;
   menu->gcodeCurrentLine = 0;
-  menu->gcodeTotalLines = static_cast<int>(sdPrintSession.lines.size());
+  menu->gcodeTotalLines = totalLines;
   menu->gcodeCurrentLineText = "Starting...";
 }
 
 void stopSdPrintSession() {
+  sdGcodeReader.closeGcodeFile();
   sdPrintSession.active = false;
   sdPrintSession.paused = false;
-  sdPrintSession.lines.clear();
   sdPrintSession.nextLine = 0;
   sdPrintSession.selectedPath = "";
 
@@ -214,32 +270,80 @@ void togglePauseSdPrintSession() {
   menu->gcodePrintPaused = sdPrintSession.paused;
 }
 
+// ── fillBatch ─────────────────────────────────────────────────────────────
+// Burst-reads up to BATCH_CAPACITY executable GCode lines from the SD card
+// into s_batchBuf.  Comment lines (layer boundaries) are processed inline:
+// pause / cancel requests are honoured and the display is refreshed.
+// Resets s_batchHead to 0 and sets s_batchCount to the number of lines read.
+// May stop or pause the session internally; callers must re-check
+// sdPrintSession.active / .paused after returning.
+static void fillBatch() {
+  s_batchCount = 0;
+  s_batchHead  = 0;
+
+  while (s_batchCount < BATCH_CAPACITY) {
+    String rawLine;
+    if (!sdGcodeReader.readLine(rawLine)) return; // EOF — keep whatever was filled
+
+    if (rawLine.charAt(0) == ';') {               // layer boundary
+      if (menu->requestCommand == MenuActions::CANCEL_SD_GCODE_PRINT) {
+        menu->requestCommand = 0;
+        stopSdPrintSession();
+        return;
+      }
+      if (menu->requestCommand == MenuActions::TOGGLE_PAUSE_SD_GCODE_PRINT) {
+        menu->requestCommand = 0;
+        togglePauseSdPrintSession();
+        return;
+      }
+      menu->update(false);
+      continue;
+    }
+
+    int cs = rawLine.indexOf(';');
+    if (cs > 0) { rawLine = rawLine.substring(0, cs); rawLine.trim(); }
+    if (rawLine.length() == 0) continue;
+
+    // Copy into fixed-size slot; lines longer than BATCH_LINE_MAX-1 chars
+    // are truncated — all GCode in this project fits within 31 chars.
+    int len = min((int)rawLine.length(), BATCH_LINE_MAX - 1);
+    memcpy(s_batchBuf[s_batchCount], rawLine.c_str(), len);
+    s_batchBuf[s_batchCount][len] = '\0';
+    s_batchCount++;
+  }
+}
+
 void serviceSdPrintSession() {
-  if (!sdPrintSession.active || sdPrintSession.paused) {
-    return;
+  if (!sdPrintSession.active || sdPrintSession.paused) return;
+
+  for (;;) {
+    // When the current batch is exhausted, dispose of it and fill the next one.
+    if (s_batchHead >= s_batchCount) {
+      fillBatch();
+      if (!sdPrintSession.active || sdPrintSession.paused) return; // cancel / pause
+      if (s_batchCount == 0) { stopSdPrintSession(); return; }     // true EOF
+    }
+
+    // Execute next line from batch — zero SD access here
+    String rawLine(s_batchBuf[s_batchHead++]);
+
+    sdPrintSession.nextLine++;
+    menu->gcodeCurrentLine     = (int)sdPrintSession.nextLine;
+    menu->gcodeCurrentLineText = rawLine;
+
+    std::vector<String> tokens = SDGcode::tokenize(rawLine);
+    if (tokens.empty()) continue;
+
+    if (!mainGcodeFunction(tokens)) gcodeInterpreter->executeCommand(rawLine);
+
+    // Yield to loop() after hardware-blocking commands so I2C / display
+    // are fully serviced before the next command runs.
+    const String &code = tokens[0];
+    if (code.equalsIgnoreCase("G31") || code.equalsIgnoreCase("G32") ||
+        code.equalsIgnoreCase("G33") || code.equalsIgnoreCase("G34") ||
+        code.equalsIgnoreCase("G35") || code.equalsIgnoreCase("G36") ||
+        code.equalsIgnoreCase("M19") || code.equalsIgnoreCase("G4")) return;
   }
-
-  if (sdPrintSession.nextLine >= sdPrintSession.lines.size()) {
-    stopSdPrintSession();
-    return;
-  }
-
-  const std::vector<String> &tokens = sdPrintSession.lines[sdPrintSession.nextLine];
-  String command = joinTokens(tokens);
-
-  menu->gcodeCurrentLineText = command;
-  menu->gcodeCurrentLine = static_cast<int>(sdPrintSession.nextLine + 1);
-  menu->gcodeTotalLines = static_cast<int>(sdPrintSession.lines.size());
-
-
-  if(!mainGcodeFunction(tokens)){
-    gcodeInterpreter->executeCommand(command);
-  }
-  else{
-    
-  }
-  
-  sdPrintSession.nextLine++;
 }
 
 bool mainGcodeFunction(const std::vector<String> &tokens) {
@@ -247,7 +351,8 @@ bool mainGcodeFunction(const std::vector<String> &tokens) {
   //Move Based : 
   //G0  -- Just travel
   // G1 -- Travel with laser on 
-  // G3 G4 G9  -- Other Movement Based Commands
+  // G3 G9  -- Other Movement Based Commands
+  //G4 is dwell
   // G28 -- Set Home G28.1 
   //Plane Setting (Redundant): G17 G18 G19 G91 G92
   // M13 -- Prep Laser
@@ -301,11 +406,9 @@ bool mainGcodeFunction(const std::vector<String> &tokens) {
 
   // ---- G-codes ----------------------------------------------------------
   if (code.equalsIgnoreCase("G30")) {
-    // Dwell — T<seconds>
+    // Dwell — T<seconds>; non-blocking so the menu stays live during the wait
     long seconds = (long)findParam('T', 0.0f);
-    if (seconds > 0) {
-      delay((unsigned long)seconds * 1000UL);
-    }
+    if (seconds > 0) waitWithMenuUpdates((uint32_t)seconds * 1000UL);
     return true;
   }
   if (code.equalsIgnoreCase("G31")) {
@@ -315,10 +418,17 @@ bool mainGcodeFunction(const std::vector<String> &tokens) {
     return true;
   }
   if (code.equalsIgnoreCase("G32")) {
-    // Prep print — Z value in mm * 1000.  Existing PREPPRINT handler
-    // expects the same scaled integer the menu sends (e.g. 49 == 49000).
-    int z = (int)findParam('Z', 0.0f);
-    i2c.sendData(IncomingCommands::PREPPRINT, z);
+    // Prep print — Z is specified in millimeters and converted to
+    // lead-screw microsteps using the thread pitch.
+    // L is still accepted, but the Z value is sent as the active prep height.
+    float zmm = findParam('Z', 0.0f);
+    long z = (long)(zmm * Z_STEPS_PER_MM + 0.5f);
+    long l = (long)findParam('L', 60000.0f);
+
+    // Then convert to the number of steps to lift the plate a to match the top
+    z = 120000 - z; // 120000 is the number of steps to reach the top (48mm * 2519.7 steps/mm)
+
+    i2c.sendData(IncomingCommands::PREPPRINT, l, z);
     waitForInternalBoard();
     return true;
   }
@@ -329,9 +439,10 @@ bool mainGcodeFunction(const std::vector<String> &tokens) {
     return true;
   }
   if (code.equalsIgnoreCase("G34")) {
-    // One small step — Z in mm * 1000
-    int z = (int)findParam('Z', 0.0f);
-    i2c.sendData(IncomingCommands::SMALLSTEP, z);
+    // One small step — Z in mm, converted to stepper steps
+    float zmm = findParam('Z', 0.0f);
+    int z = (int)(zmm * Z_STEPS_PER_MM + 0.5f); // round to nearest step
+    i2c.sendData(IncomingCommands::SMALLSTEP, 0, z);
     waitForInternalBoard();
     return true;
   }
@@ -350,28 +461,43 @@ bool mainGcodeFunction(const std::vector<String> &tokens) {
 
   // ---- M-codes ----------------------------------------------------------
   if (code.equalsIgnoreCase("M15")) {
-    // Enable vacuum pump
+    // Enable vacuum pump; T<seconds> pauses (non-blocking) after turning on
     if (relays) relays->on(Relays::VACUUM_PUMP);
+    long seconds = (long)findParam('T', 0.0f);
+    Serial.print("M15: T="); Serial.println(seconds);
+    if (seconds > 0) waitWithMenuUpdates((uint32_t)seconds * 1000UL);
     return true;
   }
   if (code.equalsIgnoreCase("M16")) {
-    // Disable vacuum pump
+    // Disable vacuum pump; T<seconds> pauses (non-blocking) after turning off
     if (relays) relays->off(Relays::VACUUM_PUMP);
+    long seconds = (long)findParam('T', 0.0f);
+    if (seconds > 0) waitWithMenuUpdates((uint32_t)seconds * 1000UL);
     return true;
   }
   if (code.equalsIgnoreCase("M17")) {
-    // Enable argon solenoid
+    // Enable argon solenoid; T<seconds> pauses (non-blocking) after turning on
     if (relays) relays->on(Relays::ARGON_SOLENOID);
+    long seconds = (long)findParam('T', 0.0f);
+    Serial.print("M17: T="); Serial.println(seconds);
+    if (seconds > 0) waitWithMenuUpdates((uint32_t)seconds * 1000UL);
     return true;
   }
   if (code.equalsIgnoreCase("M18")) {
-    // Disable argon solenoid
+    // Disable argon solenoid; T<seconds> pauses (non-blocking) after turning off
     if (relays) relays->off(Relays::ARGON_SOLENOID);
+    long seconds = (long)findParam('T', 0.0f);
+    if (seconds > 0) waitWithMenuUpdates((uint32_t)seconds * 1000UL);
     return true;
   }
   if (code.equalsIgnoreCase("M20")) {
-    // Turn circulation fan on (max speed)
+    // Turn circulation fan on — T<seconds> runs it for that duration then turns it off
     i2c.sendData(IncomingCommands::STARTFAN, 0);
+    long seconds = (long)findParam('T', 0.0f);
+    if (seconds > 0) {
+      waitWithMenuUpdates((uint32_t)seconds * 1000UL);
+      i2c.sendData(IncomingCommands::STOPFAN, 0);
+    }
     return true;
   }
   if (code.equalsIgnoreCase("M21")) {
@@ -381,12 +507,19 @@ bool mainGcodeFunction(const std::vector<String> &tokens) {
   }
   if(code.equalsIgnoreCase("M19")){
     // Pause gcode execution and prompt the user to fill material.
-    // Keep re-drawing the screen until the rotary-encoder button is pressed.
-    menu->showFillMaterialPrompt();
-    while (!handleSwitch()) {
+    // Run guide laser preview continuously so the user can see the build area,
+    // and exit as soon as the rotary-encoder button is pressed.
+    galvo->setSettingTime(menu->guideLaserSettleUs);
+    int result;
+    do {
       menu->showFillMaterialPrompt();
-      delay(50);
-    }
+      result = gcodeInterpreter->activateGuideLaserPreview([]() { return handleSwitch(); });
+      // On a completed pass the function resets counters itself; reset again
+      // here so the next iteration re-runs the setup block (guide beam on etc.)
+      if (result == gcodeInterpreter->Success) {
+        gcodeInterpreter->resetCounters();
+      }
+    } while (result != gcodeInterpreter->Idle);
     return true;
   }
 
@@ -407,6 +540,8 @@ void setup() {
   laser = new Laser(Laser::POWER50, 20000, 10); // 50% Power, 20Khz, 10% Duty Cycle
   menu = new Menu(encoder);
   gcodeInterpreter = new SerialGCodeParser(115200, galvo, laser);
+  relays = new Relays({});
+  relays->init();
   
 
   Serial.println("Starting up...");
@@ -469,11 +604,16 @@ int determineAction(int action){
   switch (action)
   {
   case MenuActions::ACTIVATE_GUIDE_LASER:
-      return gcodeInterpreter->activateGuideLaser();
+      galvo->setSettingTime(menu->guideLaserSettleUs);
+      return gcodeInterpreter->activateGuideLaser([]() { return handleSwitch(); });
+    break;
+  case MenuActions::ACTIVATE_GUIDE_LASER_PREVIEW:
+      galvo->setSettingTime(menu->guideLaserSettleUs);
+      return gcodeInterpreter->activateGuideLaserPreview([]() { return handleSwitch(); });
     break;
   case MenuActions::ACTIVATE_FIBER_LASER:
-      return gcodeInterpreter->activateLaser();
-   // return gcodeInterpreter->activateFiberLaserDebug();
+    galvo->setSettingTime(menu->fiberLaserSettleUs);
+    return gcodeInterpreter->activateFiberLaserDebug([]() { return handleSwitch(); }, menu->fiberLaserPower);
     break;
   case MenuActions::DEACTIVATE_GUIDE_LASER:
       return gcodeInterpreter->deactivateGuideLaser();
@@ -507,7 +647,7 @@ int determineAction(int action){
       return gcodeInterpreter->Success;
     break;
   case MenuActions::SMALL_STEP:
-    i2c.sendData(IncomingCommands::SMALLSTEP, 1000);
+    i2c.sendData(IncomingCommands::SMALLSTEP, 0, 1000);
     return gcodeInterpreter->Success;
     break;
   case MenuActions::START_FAN:
@@ -519,7 +659,7 @@ int determineAction(int action){
     return gcodeInterpreter->Success;
     break;
   case MenuActions::ONE_CYCLE:
-    i2c.sendData(IncomingCommands::SMALLSTEP, 50);
+    i2c.sendData(IncomingCommands::SMALLSTEP, 0, 50);
     delay(100);
     i2c.sendData(IncomingCommands::MOVEBAR, 0);
     return gcodeInterpreter->Success;
@@ -553,7 +693,7 @@ int determineAction(int action){
      //delay(7500);
      Serial.print("Laser Done. Layer: "); Serial.println(i);
   
-      i2c.sendData(IncomingCommands::SMALLSTEP, 40); // 200 // 50
+      i2c.sendData(IncomingCommands::SMALLSTEP, 0, 40); // 200 // 50
       Serial.println("Small Step");
 
       delay(7500);
@@ -576,8 +716,5 @@ int determineAction(int action){
     break;
   };
 
-  
-
-  //i2c.sendData(10,11); // Placeholder to keep I2C active
-  
+  return gcodeInterpreter->Idle;
 }

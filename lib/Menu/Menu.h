@@ -50,6 +50,11 @@ enum MenuActions {
     TOGGLE_PAUSE_SD_GCODE_PRINT = 28,
     START_FAN = 29,
     STOP_FAN = 30,
+    SET_GUIDE_LASER_SPEED = 31,
+    SET_FIBER_LASER_SPEED = 32,
+    SET_FIBER_LASER_POWER = 33,
+    SET_GUIDE_LASER_CUBE_SIZE = 34,
+    ACTIVATE_GUIDE_LASER_PREVIEW = 35,
 };
 
 class Lnode {
@@ -114,6 +119,10 @@ class Menu {
         bool alarm  = 0; // An alarm command to default to issues 
         int waitforResponse = 0; // a callback in  main to show 
         bool confirmCompletion = false; // Change this value to confirm the menu should return to its normal status
+        int guideLaserSettleUs = 2000;  // Settling time (µs) set by the speed-selection screen before guide laser runs
+        int guideLaserCubeSize = 2000;  // Preview cube size (galvo units) set by the cube-size selection screen
+        int fiberLaserSettleUs = 2000;        // Settling time (µs) for fiber laser scan
+        int fiberLaserPower = 70;           // Power level (0-100) set by the power-selection screen
 
         String selectedGcodePath = "";
         bool gcodePrintActive = false;
@@ -180,6 +189,10 @@ class Menu {
         void printGcodeStatus();
         void deactivateFiberLaser();
         void deactivateGuideLaser();
+        void guideLaserSpeedSettings();
+        void guideLaserCubeSizeSettings();
+        void fiberLaserSpeedSettings();
+        void fiberLaserPowerSettings();
         void refreshGcodeFiles();
         void startFan();
         void stopFan();

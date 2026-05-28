@@ -36,6 +36,8 @@ void XY2_100::tickingDelay(unsigned long us) {
 
 void XY2_100::waitSettingTime() { tickingDelay(_setting_time_us); }
 
+void XY2_100::setSettingTime(unsigned long us) { _setting_time_us = us; }
+
 void XY2_100::_write(int x, int y) {
   // beign data frame
   _clock->set(1);

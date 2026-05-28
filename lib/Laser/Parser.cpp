@@ -66,13 +66,15 @@ void SerialGCodeParser::_parse(String command) {
   if (command.startsWith("G0")) {
     _g0(_extract_xy);
   } else if (command.startsWith("G1")) {
-    _g1(command[3], extractValue(command[3]));
+    _g1(_extract_xy);
   } else if (command.startsWith("G2")) {
     _g2(_extract_xy, extractValue('I'), extractValue('J'), extractValue('R'));
   } else if (command.startsWith("G3")) {
     _g3(_extract_xy, extractValue('I'), extractValue('J'), extractValue('R'));
   } else if (command.startsWith("G4")) {
-    _g4(extractValue('P'));
+    double s = extractValue('S');
+    double p = extractValue('P');
+    _g4(s > 0 ? s : p);
   } else if (command.startsWith("M54")) {
     _m54();
   } else if (command.startsWith("M56")) {
@@ -114,6 +116,9 @@ void SerialGCodeParser::_parse(String command) {
   } else if (command.startsWith("M09")) {
     // _m09();
     Serial.println("M09 not suppported");
+  } else if (command.startsWith("M58")) {
+    // M58 F<mm_per_min> — set feedrate for G1 linear moves.
+    _m58(extractValue('F'));
   } else if (command.startsWith("M13")) {
     double pValue = extractValue('P');
     double fValue = extractValue('F');

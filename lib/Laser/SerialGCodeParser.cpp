@@ -131,8 +131,8 @@ int SerialGCodeParser::activateLaser(){
     Serial.println("FIBER LASER STARTING"); 
     _m57("L1"); // Turn the guide beam off
 
-    _laser1->turnOn();
-
+    //_laser1->turnOn();
+    _m54(); // Turn Laser on
     return Success;
 
   }
@@ -159,8 +159,7 @@ int SerialGCodeParser::deactivateLaser(){
 
 //Activate the guide beam and be directed by the galvo. Should serve as a test to see if the galvo is functioning normally.
 
-int SerialGCodeParser::activateGuideLaser(){
-
+int SerialGCodeParser::activateGuideLaser(std::function<bool()> cancelCheck){
 
   if(counters[0] == 0){
     Serial.println("Activating Guide Laser");
@@ -168,13 +167,7 @@ int SerialGCodeParser::activateGuideLaser(){
     _m56("L1"); // Turn Guide Beam on
     if(_laser1->getAlarmState()){
       return Alarm;
-
     }
-
-  
-    //_g90();
-    //_g92(buildPlateOriginX,buildPlateOriginY); //Absolute Distance mode 
-    //_g28();
 
     delay(10);
 
@@ -182,74 +175,86 @@ int SerialGCodeParser::activateGuideLaser(){
     _y_origin = buildPlateOriginY;
 
     _g0(_x_origin, _y_origin);
-    //_g1('X', buildPlateOriginX);
-    //_g1('Y', buildPlateOriginY);
-
-    //_g28();
-    
-
-    
-   // _g1('X', buildPlateOriginX-plateSizeX);
-   // _g1('Y', buildPlateOriginY-plateSizeY);
-
-    counters[0]++; 
+    counters[0]++;
   }
 
-  //Serial.println(counters[1]);
-
-  //50 is slow
-  //500 is relatively fast
-  //1599 is extremley fast 
-  counters[1] += 100;
-
-  switch(counters[2]){
-    case 0:
-      _g0(0, counters[1]);
-    break;
-    case 1:
-      _g0(counters[1], plateSizeY);
-    break;
-    case 2:
-      _g0(plateSizeX, plateSizeY - counters[1]);
-    break;
-    case 3:
-      _g0(plateSizeX - counters[1], 0);
-    case 4:
-      _g0(counters[3], counters[1]  );
-    break;
-
-    default:
-
-    break;
+  // Perimeter — cancel checked per side
+  for(int i = plateSizeY / 2 * -1; i <= plateSizeY /2 ; i += 100){
+    if(cancelCheck && cancelCheck()){ _m57("L1"); resetCounters(); return Idle; }
+    _g1(plateSizeX/2 * -1, i);
   }
-  smallDelay();
+  for(int i = plateSizeX / 2 * -1; i <= plateSizeX /2 ; i += 100){
+    if(cancelCheck && cancelCheck()){ _m57("L1"); resetCounters(); return Idle; }
+    _g1(i, plateSizeY / 2);
+  }
+  for(int i = plateSizeY / 2; i >= plateSizeY / 2 * -1; i -= 100){
+    if(cancelCheck && cancelCheck()){ _m57("L1"); resetCounters(); return Idle; }
+    _g1(plateSizeX / 2, i);
+  }
+  for(int i = plateSizeX / 2; i >= plateSizeX / 2 * -1; i -= 100){
+    if(cancelCheck && cancelCheck()){ _m57("L1"); resetCounters(); return Idle; }
+    _g1(i, plateSizeY / 2 * -1);
+  }
 
-  counters[1]++;
-  if(counters[1] > plateSizeX ){
-    counters[1] = 0;
-
-    if(counters[2] !=  4 || counters[3] == plateSizeX ){
-      counters[2]++;
-      counters[3] = 0;
-    }
-    else{
-      counters[3] += 100;
-    }
-
-    if(counters[2] > 4){
-      counters[2] = 0;
-      
+  // Fill — cancel checked per column
+  for(int x = plateSizeX / 2 * -1; x <= plateSizeX /2 ; x += 100){
+    if(cancelCheck && cancelCheck()){ _m57("L1"); resetCounters(); return Idle; }
+    for(int y = plateSizeY / 2 * -1; y <= plateSizeY /2 ; y += 100){
+      _g1(x, y);
     }
   }
 
-  counters[1]++;
-
-  return Cycle;
+  _m57("L1"); // Turn guide beam off when done
+  resetCounters();
+  return Success;
 }
 
-int SerialGCodeParser::activateFiberLaserDebug(){
+// Traces the perimeter of a custom-sized square so the user can preview where the laser will fire.
+int SerialGCodeParser::activateGuideLaserPreview(std::function<bool()> cancelCheck,int sizeX, int sizeY){
 
+  if(counters[0] == 0){
+    Serial.printf("Guide Laser Preview: %d x %d\n", sizeX, sizeY);
+    _m13(8, 30000, 128);
+    _m56("L1"); // Turn guide beam on
+    if(_laser1->getAlarmState()){ return Alarm; }
+    delay(10);
+    _x_origin = buildPlateOriginX;
+    _y_origin = buildPlateOriginY;
+    _g0(_x_origin, _y_origin);
+    counters[0]++;
+  }
 
+  // Trace perimeter twice so it is clearly visible.
+  // Uses the same corner-anchored coordinate system as activateGuideLaser:
+  // (0,0) = bottom-left of build plate, (sizeX,sizeY) = top-right.
+  for(int pass = 0; pass < 2; pass++){
+     for(int i = plateSizeY / 2 * -1; i <= plateSizeY /2 ; i += 100){
+    if(cancelCheck && cancelCheck()){ _m57("L1"); resetCounters(); return Idle; }
+    _g1(plateSizeX/2 * -1, i);
+  }
+  for(int i = plateSizeX / 2 * -1; i <= plateSizeX /2 ; i += 100){
+    if(cancelCheck && cancelCheck()){ _m57("L1"); resetCounters(); return Idle; }
+    _g1(i, plateSizeY / 2);
+  }
+  for(int i = plateSizeY / 2; i >= plateSizeY / 2 * -1; i -= 100){
+    if(cancelCheck && cancelCheck()){ _m57("L1"); resetCounters(); return Idle; }
+    _g1(plateSizeX / 2, i);
+  }
+  for(int i = plateSizeX / 2; i >= plateSizeX / 2 * -1; i -= 100){
+    if(cancelCheck && cancelCheck()){ _m57("L1"); resetCounters(); return Idle; }
+    _g1(i, plateSizeY / 2 * -1);
+  }
+  }
+
+  _m57("L1");
+  resetCounters();
+  return Success;
+}
+
+//Make a cube like shape with the fiber laser to test its functionality
+int SerialGCodeParser::activateFiberLaserDebug(std::function<bool()> cancelCheck, int power){
+
+  Serial.println("Activating Fiber Laser Debug Mode");
 
   if(counters[0] == 0){
     _m57("L1"); // Turn the guide beam off
@@ -259,7 +264,7 @@ int SerialGCodeParser::activateFiberLaserDebug(){
 
     _g28(); // Home galvo
 
-    _m13(70, 50000, 155); // Prepare the laser
+    _m13(power, 50000, 128); // Prepare the laser
     _m54(); // Turn Laser on
     _g0(0,0); // Also home galvo (center of chamber) 
     int code = _laser1->getAlarmState();
@@ -276,39 +281,48 @@ int SerialGCodeParser::activateFiberLaserDebug(){
     }
     
 
-    counters[0]++; 
-    
+    counters[0]++;
+
+    _m54(); // Re-enable laser (turned off by _g0 rapid move above)
 
   }
 
-  for(int i = 0; i < plateSizeY; i++){
-     _g0(0, i);
-     smallDelay();
+  Serial.println("Scanning perimeter...");
 
+  for(int i = 0; i < plateSizeY; i++){
+    if(cancelCheck && cancelCheck()){ _m55(); resetCounters(); return Idle; }
+     _g1(0, i);
+  
   }
 
   for(int i = 0; i < plateSizeX; i++){
-     _g0(i, plateSizeY);
-     smallDelay();
+    if(cancelCheck && cancelCheck()){ _m55(); resetCounters(); return Idle; }
+     _g1(i, plateSizeY);
 
   }
+
   for(int i = plateSizeY; i > 0; i--){
-     _g0(plateSizeX, plateSizeY - i);
-     smallDelay();
+    if(cancelCheck && cancelCheck()){ _m55(); resetCounters(); return Idle; }
+     _g1(plateSizeX, plateSizeY - i);
 
   }
+
   for(int i = plateSizeX; i > 0; i--){
-     _g0(plateSizeX - i ,  0);
-     smallDelay();
+    if(cancelCheck && cancelCheck()){ _m55(); resetCounters(); return Idle; }
+     _g1(plateSizeX - i, 0);
 
   }
+
+  Serial.println("Scanning fill...");
 
   for(int i = 0; i < plateSizeX; i += 5){
-    for(int j =0; j < plateSizeY; j++){
-      _g0(i, j);
-      smallDelay();
+    if(cancelCheck && cancelCheck()){ _m55(); resetCounters(); return Idle; }
+    if(i % 100 == 0){ Serial.printf("  Fill column %d / %d\n", i, plateSizeX); }
+    for(int j = 0; j < plateSizeY; j++){
+      if(cancelCheck && cancelCheck()){ _m55(); resetCounters(); return Idle; }
+      _g1(i, j);
+  
     }
-
   }
 
   _m55();
@@ -318,62 +332,6 @@ int SerialGCodeParser::activateFiberLaserDebug(){
    //delay(10);
 
   
-  
-
-  //Serial.println(counters[1]);
-
-  //50 is slow
-  //500 is relatively fast
-  //1599 is extremley fast 
-
-  /*
-  counters[1] += 75;
-
-  switch(counters[2]){
-    case 0:
-      _g0(0, counters[1]);
-    break;
-    case 1:
-      _g0(counters[1], plateSizeY);
-    break;
-    case 2:
-      _g0(plateSizeX, plateSizeY - counters[1]);
-    break;
-    case 3:
-      _g0(plateSizeX - counters[1], 0);
-    case 4:
-      _g0(counters[3], counters[1]  );
-    break;
-
-    default:
-
-    break;
-  }
-  smallDelay();
-
-  counters[1]++;
-  if(counters[1] > plateSizeX ){
-    counters[1] = 0;
-
-    if(counters[2] !=  4 || counters[3] == plateSizeX ){
-      counters[2]++;
-      counters[3] = 0;
-    }
-    else{
-      counters[3] += 75;
-    }
-
-    if(counters[2] > 4){
-      counters[2] = 0;
-      
-    }
-  }
-
-  counters[1]++;
-
-  return Cycle;
-
-  */ 
 }
 
 int SerialGCodeParser::deactivateGuideLaser(){

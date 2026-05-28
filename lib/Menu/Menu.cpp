@@ -54,6 +54,7 @@ void Menu::begin() {
     addNode(head, Lnode("About",MenuActions::MAIN_MENU, MenuActions::  ABOUT_MENU)); //4
     addNode(head, Lnode("Printer Info",MenuActions::ABOUT_MENU, MenuActions::PRINT_INFO)); //5
     addNode(head, Lnode("Print Cube",MenuActions::PRINT_MENU,MenuActions::PRINT_CUBE)); //6
+    addNode(head, Lnode("Guide Laser Preview",MenuActions::PRINT_MENU, MenuActions::ACTIVATE_GUIDE_LASER_PREVIEW));
     addNode(head, Lnode("Print From SD",MenuActions::PRINT_MENU,MenuActions::GET_GCODE_FILES)); //6
     addNode(head, Lnode("Set Vaccum Chamber",MenuActions::SETTINGS_MENU,MenuActions::PUMP_CHAMBER)); //6
     addNode(head, Lnode("Fiber Calibration",MenuActions::SETTINGS_MENU, MenuActions::CALIBRATE_FIBER)); //7
@@ -65,9 +66,9 @@ void Menu::begin() {
     addNode(head, Lnode("Debug Controls",MenuActions::TOOLS_MENU, MenuActions::PRINT_DEBUG)); 
     addNode(head, Lnode("Run Through Step by Step",MenuActions::PRINT_DEBUG, MenuActions::SMALL_STEP)); 
     addNode(head, Lnode("Do One Cycle",MenuActions::PRINT_DEBUG, MenuActions::ONE_CYCLE)); 
-    addNode(head, Lnode("Turn on Guide Laser",MenuActions::PRINT_TOGGLE_LASER, MenuActions::ACTIVATE_GUIDE_LASER)); //9
+    addNode(head, Lnode("Turn on Guide Laser",MenuActions::PRINT_TOGGLE_LASER, MenuActions::SET_GUIDE_LASER_SPEED)); //9
     addNode(head, Lnode("Turn off Guide Laser",MenuActions::PRINT_TOGGLE_LASER, MenuActions::DEACTIVATE_GUIDE_LASER)); //9
-    addNode(head, Lnode("Turn on Fiber Laser",MenuActions::PRINT_TOGGLE_LASER, MenuActions::ACTIVATE_FIBER_LASER)); //10
+    addNode(head, Lnode("Turn on Fiber Laser",MenuActions::PRINT_TOGGLE_LASER, MenuActions::SET_FIBER_LASER_SPEED)); //10
     addNode(head, Lnode("Turn off Fiber Laser",MenuActions::PRINT_TOGGLE_LASER, MenuActions::DEACTIVATE_FIBER_LASER)); //10
     addNode(head, Lnode("Homing Settings",MenuActions::SETTINGS_MENU, MenuActions::PRINT_HOMING)); //11
     addNode(head, Lnode("Home All",MenuActions::PRINT_HOMING, MenuActions::HOME_ALL)); //8
@@ -123,7 +124,15 @@ void Menu::update(bool buttonState) {
 
     if (gcodePrintActive) {
         this->encoder->setMinMax(0, 1);
-        this->currentSelection = this->encoder->getPosition();
+        // If the position drifted outside [0,1] (e.g. encoder was moved
+        // before the print started, or minMax hadn't been applied yet),
+        // clamp it now so button presses always land on a valid option.
+        int32_t pos = this->encoder->getPosition();
+        if (pos < 0 || pos > 1) {
+            pos = 0;
+            this->encoder->setPosition(0);
+        }
+        this->currentSelection = pos;
         if (buttonState) {
             if (this->currentSelection == 0) {
                 requestCommand = MenuActions::TOGGLE_PAUSE_SD_GCODE_PRINT;
@@ -167,6 +176,39 @@ void Menu::update(bool buttonState) {
                     goToMainMenu();
                     this->encoder->setPosition(0);
                     this->currentSelection = 0;
+                }
+                return;
+            }
+
+            if (this->currentNode->act == MenuActions::SET_GUIDE_LASER_SPEED) {
+                if (this->encoder->getPosition() == 0 && this->currentNode->back != nullptr) {
+                    back();
+                } else {
+                    requestCommand = MenuActions::ACTIVATE_GUIDE_LASER;
+                }
+                return;
+            }
+
+            if (this->currentNode->act == MenuActions::SET_FIBER_LASER_SPEED) {
+                if (this->encoder->getPosition() == 0 && this->currentNode->back != nullptr) {
+                    back();
+                } else {
+                    // Save speed and advance to power screen
+                    this->currentNode->act = MenuActions::SET_FIBER_LASER_POWER;
+                    this->encoder->setPosition(1);
+                }
+                return;
+            }
+
+            if (this->currentNode->act == MenuActions::SET_FIBER_LASER_POWER) {
+                if (this->encoder->getPosition() == 0) {
+                    // Back to speed screen
+                    this->currentNode->act = MenuActions::SET_FIBER_LASER_SPEED;
+                    this->encoder->setPosition(1);
+                } else {
+                    // Confirm — execute fiber laser; reset node for next use
+                    this->currentNode->act = MenuActions::SET_FIBER_LASER_SPEED;
+                    requestCommand = MenuActions::ACTIVATE_FIBER_LASER;
                 }
                 return;
             }
@@ -332,11 +374,27 @@ void Menu::actionSwitch(int actionNum){
             break;
         case MenuActions::CALIBRATE_VACUUM:
             break;
+        case MenuActions::SET_GUIDE_LASER_SPEED:
+            guideLaserSpeedSettings();
+            break;
+        case MenuActions::SET_GUIDE_LASER_CUBE_SIZE:
+            guideLaserCubeSizeSettings();
+            break;
+        case MenuActions::ACTIVATE_GUIDE_LASER_PREVIEW:
+            requestCommand = MenuActions::ACTIVATE_GUIDE_LASER_PREVIEW;
+            break;
+        case MenuActions::SET_FIBER_LASER_SPEED:
+            fiberLaserSpeedSettings();
+            break;
+        case MenuActions::SET_FIBER_LASER_POWER:
+            fiberLaserPowerSettings();
+            break;
         case MenuActions::ACTIVATE_GUIDE_LASER:
             activateGuideLaser();
             break;
         case MenuActions::DEACTIVATE_GUIDE_LASER:
             deactivateGuideLaser();
+            break;
         case MenuActions::ONE_CYCLE:
             oneCycle();
             break;
@@ -558,6 +616,118 @@ void Menu::deactivateGuideLaser(){
     this->u8g2->clearBuffer();
     this->u8g2->drawButtonUTF8(105, 10, (encoder->getPosition() == 0 ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV), 34, 2, 0, "Back");
     this->u8g2->drawButtonUTF8(128/2,20,(encoder->getPosition() == 1 ? U8G2_BTN_HCENTER|U8G2_BTN_BW2 : U8G2_BTN_HCENTER|U8G2_BTN_INV), 34 ,2 ,0, "Toggling Guide Laser");
+    this->u8g2->sendBuffer();
+}
+
+void Menu::fiberLaserSpeedSettings(){
+    static const int   speedValues[] = { 1000, 500, 250, 50 };
+    static const char* speedLabels[] = { "Slow  1000us", "Normal 500us", "Fast   250us", "Max     50us   " };
+    const int numSpeeds = 4;
+
+    this->encoder->setMinMax(0, numSpeeds);
+    this->encoder->setWrapAround(false);
+
+    int pos = encoder->getPosition();
+    if (pos >= 1 && pos <= numSpeeds) {
+        fiberLaserSettleUs = speedValues[pos - 1];
+    }
+
+    this->u8g2->clearBuffer();
+    this->u8g2->setFont(u8g2_font_helvR08_tf);
+    this->u8g2->drawStr(0, 8, "Fiber Laser Speed");
+    this->u8g2->drawLine(0, 10, 128, 10);
+    this->u8g2->drawButtonUTF8(115, 8,
+        pos == 0 ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV,
+        24, 1, 0, "Back");
+    for (int i = 0; i < numSpeeds; i++) {
+        this->u8g2->drawButtonUTF8(64, 22 + i * 12,
+            pos == (i + 1) ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV,
+            62, 1, 0, speedLabels[i]);
+    }
+    this->u8g2->sendBuffer();
+}
+
+void Menu::fiberLaserPowerSettings(){
+    static const int   powerValues[] = { 30, 50, 70, 90 };
+    static const char* powerLabels[] = { "Low      30", "Medium   50", "High     70", "Max      90" };
+    const int numPowers = 4;
+
+    this->encoder->setMinMax(0, numPowers);
+    this->encoder->setWrapAround(false);
+
+    int pos = encoder->getPosition();
+    if (pos >= 1 && pos <= numPowers) {
+        fiberLaserPower = powerValues[pos - 1];
+    }
+
+    this->u8g2->clearBuffer();
+    this->u8g2->setFont(u8g2_font_helvR08_tf);
+    this->u8g2->drawStr(0, 8, "Fiber Laser Power");
+    this->u8g2->drawLine(0, 10, 128, 10);
+    this->u8g2->drawButtonUTF8(115, 8,
+        pos == 0 ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV,
+        24, 1, 0, "Back");
+    for (int i = 0; i < numPowers; i++) {
+        this->u8g2->drawButtonUTF8(64, 22 + i * 12,
+            pos == (i + 1) ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV,
+            62, 1, 0, powerLabels[i]);
+    }
+    this->u8g2->sendBuffer();
+}
+
+void Menu::guideLaserCubeSizeSettings(){
+    static const int   sizeValues[] = { 500, 1000, 1500, 2000 };
+    static const char* sizeLabels[] = { "Small   (500)", "Medium (1000)", "Large  (1500)", "Full   (2000)" };
+    const int numSizes = 4;
+
+    this->encoder->setMinMax(0, numSizes);
+    this->encoder->setWrapAround(false);
+
+    int pos = encoder->getPosition();
+    if (pos >= 1 && pos <= numSizes) {
+        guideLaserCubeSize = sizeValues[pos - 1];
+    }
+
+    this->u8g2->clearBuffer();
+    this->u8g2->setFont(u8g2_font_helvR08_tf);
+    this->u8g2->drawStr(0, 8, "Cube Preview Size");
+    this->u8g2->drawLine(0, 10, 128, 10);
+    this->u8g2->drawButtonUTF8(115, 8,
+        pos == 0 ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV,
+        24, 1, 0, "Back");
+    for (int i = 0; i < numSizes; i++) {
+        this->u8g2->drawButtonUTF8(64, 22 + i * 12,
+            pos == (i + 1) ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV,
+            62, 1, 0, sizeLabels[i]);
+    }
+    this->u8g2->sendBuffer();
+}
+
+void Menu::guideLaserSpeedSettings(){
+    static const int   speedValues[] = { 20000, 5000, 2500, 1000 };
+    static const char* speedLabels[] = { "Slow  20000us", "Normal 5000us", "Fast   2500us", "Max     1000us" };
+    const int numSpeeds = 4;
+
+    this->encoder->setMinMax(0, numSpeeds);
+    this->encoder->setWrapAround(false);
+
+    int pos = encoder->getPosition();
+    if (pos >= 1 && pos <= numSpeeds) {
+        guideLaserSettleUs = speedValues[pos - 1];
+    }
+
+    this->u8g2->clearBuffer();
+    this->u8g2->setFont(u8g2_font_helvR08_tf);
+    this->u8g2->drawStr(0, 8, "Galvo Speed");
+    this->u8g2->drawLine(0, 10, 128, 10);
+    this->u8g2->drawButtonUTF8(115, 8,
+        pos == 0 ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV,
+        24, 1, 0, "Back");
+    for (int i = 0; i < numSpeeds; i++) {
+        this->u8g2->drawButtonUTF8(64, 22 + i * 12,
+            pos == (i + 1) ? U8G2_BTN_HCENTER | U8G2_BTN_BW2 : U8G2_BTN_HCENTER | U8G2_BTN_INV,
+            62, 1, 0, speedLabels[i]);
+    }
     this->u8g2->sendBuffer();
 }
 

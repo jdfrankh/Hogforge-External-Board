@@ -92,6 +92,75 @@ std::vector<std::vector<String>> SDGcode::parseGcodeFile(const String &filePath)
     return parsedLines;
 }
 
+// --- Streaming API ---
+
+static bool parseLine(const String &raw, std::vector<String> &tokens) {
+    String line = raw;
+    line.replace("\r", "");
+    line.trim();
+    if (line.length() == 0) return false;
+    int cs = line.indexOf(';');
+    if (cs == 0) return false;
+    if (cs > 0) { line = line.substring(0, cs); line.trim(); }
+    if (line.length() == 0) return false;
+    tokens = tokenizeByWhitespace(line);
+    return !tokens.empty();
+}
+
+int SDGcode::countGcodeLines(const String &filePath) {
+    if (!initialized) return 0;
+    File file = SD.open(filePath.c_str());
+    if (!file || file.isDirectory()) { if (file) file.close(); return 0; }
+    int count = 0;
+    std::vector<String> dummy;
+    while (file.available()) {
+        String line = file.readStringUntil('\n');
+        if (parseLine(line, dummy)) count++;
+    }
+    file.close();
+    return count;
+}
+
+bool SDGcode::openGcodeFile(const String &filePath) {
+    if (!initialized) return false;
+    if (_streamFile) _streamFile.close();
+    _streamFile = SD.open(filePath.c_str());
+    return (_streamFile && !_streamFile.isDirectory());
+}
+
+bool SDGcode::readLine(String &line) {
+    if (!_streamFile) return false;
+    while (_streamFile.available()) {
+        line = _streamFile.readStringUntil('\n');
+        line.replace("\r", "");
+        line.trim();
+        if (line.length() > 0) return true;
+    }
+    return false; // EOF
+}
+
+bool SDGcode::readNextGcodeLine(std::vector<String> &tokens) {
+    tokens.clear();
+    String line;
+    while (readLine(line)) {
+        if (line.charAt(0) == ';') continue; // skip comment-only lines
+        int cs = line.indexOf(';');
+        if (cs > 0) { line = line.substring(0, cs); line.trim(); }
+        if (line.length() == 0) continue;
+        tokens = tokenizeByWhitespace(line);
+        if (!tokens.empty()) return true;
+    }
+    return false; // EOF
+}
+
+std::vector<String> SDGcode::tokenize(const String &line) {
+    return tokenizeByWhitespace(line);
+}
+
+void SDGcode::closeGcodeFile() {
+    if (_streamFile) _streamFile.close();
+}
+
 void SDGcode::collectGcodeFiles(const String &basePath, std::vector<String> &files) {
     File dir = SD.open(basePath.c_str());
     if (!dir || !dir.isDirectory()) {

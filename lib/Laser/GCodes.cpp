@@ -7,18 +7,41 @@
   (_galvo->getY() + (_absoluteMode ? _y_origin : 0))
 
 void SerialGCodeParser::_g1(int x, int y) {
- 
-  //_m55();
-  _m54();
-  _galvo->setXY(centerX(x), centerY(y));
-  
-  /* if (axis == 'X') {
-    _galvo->setXY(target, _galvo_mode_adjusted_y);
-  } else if (axis == 'Y') {
-    _galvo->setXY(_galvo_mode_adjusted_x, target);
+  if (!_galvo) return;
+  // G1 is a cutting move: re-enable the laser unless stopped or guide beam is active.
+  if (!_stopped && !_guide_beam_on) _m54();
+  int tx = centerX(x), ty = centerY(y);
+  int x0 = _galvo->getX();
+  int y0 = _galvo->getY();
+  float dx = (float)(tx - x0);
+  float dy = (float)(ty - y0);
+  float dist = sqrtf(dx * dx + dy * dy); // galvo units
+
+  if (dist < 0.5f) return; // already at target
+
+  if (_feedrate_mm_per_min <= 0.0f) {
+    // No feedrate set — single jump
+    _galvo->setXY(tx, ty);
+    return;
   }
 
-*/
+  // One step per galvo unit; gives ~5 µm resolution across the build plate.
+  int steps = max(1, (int)dist);
+
+  // Total time for the move at the requested feedrate, divided evenly per step.
+  float dist_mm = dist / GALVO_UNITS_PER_MM;
+  float total_us = dist_mm / _feedrate_mm_per_min * 60.0e6f;
+  unsigned long dwell_us = (unsigned long)(total_us / steps);
+  if (dwell_us < 1) dwell_us = 1;
+
+  _galvo->setSettingTime(dwell_us);
+
+  // Walk intermediate points; final call uses exact target to avoid rounding drift.
+  for (int i = 1; i < steps; i++) {
+    float t = (float)i / (float)steps;
+    _galvo->setXY((int)(x0 + dx * t + 0.5f), (int)(y0 + dy * t + 0.5f));
+  }
+  _galvo->setXY(tx, ty);
 }
 
 void SerialGCodeParser::_drawCircle(double x, double y, double i, double j,

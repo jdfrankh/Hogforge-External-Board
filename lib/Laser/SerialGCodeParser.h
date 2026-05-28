@@ -6,6 +6,7 @@
 #include <WString.h> 
 #include <SD.h>
 #include <SPI.h>
+#include <functional>
 
 
 /// @brief Acts as a middleman between serial port inputs, anm XY2-100 galvo and
@@ -24,13 +25,32 @@ public:
 
   bool isMediaPresent(); 
 
-  int activateGuideLaser();
+  int activateGuideLaser(std::function<bool()> cancelCheck = nullptr);
+  int activateGuideLaserPreview(std::function<bool()> cancelCheck = nullptr,
+    int sizeX = SerialGCodeParser::mmToGalvo(50.8f),   // 2 inches → 10000
+    int sizeY = SerialGCodeParser::mmToGalvo(50.8f)); // 10000 is roughly 2inches
+    
   int deactivateGuideLaser();
   int activateLaser();
   int deactivateLaser();
-  int activateFiberLaserDebug();
+  int activateFiberLaserDebug(std::function<bool()> cancelCheck = nullptr, int power = 70);
   int centerX(int desiredX);
   int centerY(int desiredY);
+
+  // --- Galvo unit <-> physical unit conversions ---
+  // Calibration: 10000 units ≈ 2 inches  →  5000 units/inch, ~196.85 units/mm
+  static constexpr float GALVO_UNITS_PER_INCH = 5000.0f;
+  static constexpr float GALVO_UNITS_PER_MM   = 5000.0f / 25.4f;
+
+  /// @brief Convert millimeters to galvo units
+  static int mmToGalvo(float mm)           { return (int)(mm * GALVO_UNITS_PER_MM); }
+  /// @brief Convert inches to galvo units
+  static int inchesToGalvo(float inches)   { return (int)(inches * GALVO_UNITS_PER_INCH); }
+  /// @brief Convert galvo units to millimeters
+  static float galvoToMm(int units)        { return units / GALVO_UNITS_PER_MM; }
+  /// @brief Convert galvo units to inches
+  static float galvoToInches(int units)    { return units / GALVO_UNITS_PER_INCH; }
+
   int returnValue = 0;
 
   const int countDownUpdate = 200; 
@@ -145,10 +165,14 @@ private:
   int buildPlateOriginX = 13500;
   int buildPlateOriginY = 13500;
 
-  const int plateSizeX = 2000; 
-  const int plateSizeY = 2000; 
+  const int plateSizeX = 9500; 
+  const int plateSizeY = 12000; 
 
-  
+  /// @brief Feed rate set via M58 F<mm_per_min>. 0 = fixed settling time (legacy).
+  float _feedrate_mm_per_min = 0.0f;
+
+  /// @brief True when the guide beam is active (M56). Suppresses fiber laser in G1.
+  bool _guide_beam_on = false;
 
 #pragma endregion
 
@@ -482,6 +506,11 @@ private:
    * M57 L2 ; Turn Guide Beam Off for Laser 2
    */
   void _m57(String laser);
+
+  /// @brief M58 — Set galvo scan feed rate in mm/min.
+  /// Dwell time per G1 move is computed dynamically from move distance.
+  /// Example: M58 F300000 ; 300 000 mm/min ≈ 5000 mm/s
+  void _m58(float mm_per_min);
 
   /**
    * @brief Executes an M60 Branch Shutter 1 Open command.

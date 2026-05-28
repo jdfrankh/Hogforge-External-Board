@@ -67,4 +67,9 @@ public:
 
   /// @brief Gets the current position of the Y axis mirror
   int getY();
+
+  /// @brief Sets the mirror settling delay (microseconds per position command).
+  /// Lower values = faster scan; minimum is hardware-dependent (~50 µs at 20k pps).
+  /// @param us Settling time in microseconds
+  void setSettingTime(unsigned long us);
 };
